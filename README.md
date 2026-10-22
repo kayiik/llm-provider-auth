@@ -2,19 +2,26 @@
 
 Modular Go credential resolvers, OAuth flows, and session token brokers for LLM providers.
 
-## Modules & Drivers
+## Packages & Drivers
 
-Each driver is an independent subpackage with zero unnecessary dependencies:
+Each driver is an independent subpackage in one Go module, using only the standard library:
 
 - **`gcp`**: Google Cloud Service Account JWT RS256 token minter. **Zero Google Cloud SDK dependencies** (pure standard library `crypto/rsa` and `crypto/x509`).
 - **`browseroauth`**: Storage-neutral browser OAuth primitives with caller-supplied endpoints and client configuration, PKCE S256, state generation, code exchange, and refresh.
-- **`tokenstore`**: A storage contract and refresh coordinator that spend a rotating refresh token exactly once, even when several processes share one credential store. It includes an in-memory reference store and the `tokenstore/storetest` conformance suite.
+- **`tokenstore`**: A storage contract and coordinator that serialize refreshes per credential key across cooperating callers and processes when the store supplies a shared exclusive lease. It includes an in-memory reference store and the `tokenstore/storetest` conformance suite.
 
-No package reads environment variables, runs an `init` function, or keeps
+Library code reads no environment variables, runs no `init` functions, and keeps no
 mutable package-level state; callers supply all configuration explicitly. An
 architecture test enforces this.
 
+This library supplies credential/token primitives. Applications own persistent
+storage and browser/callback orchestration; provider allowance collectors and
+emergency-fallback SDK behavior are outside this module.
+
 ## Installation
+
+The current source requires Go 1.26.6 or newer. The commands below install
+published packages; they do not include changes from a local working checkout.
 
 ```bash
 # Core interfaces
@@ -53,6 +60,9 @@ if err != nil {
 // and clock, and mints a new token shortly before the cached one expires.
 var tokens gcp.TokenCache
 token, err := tokens.AccessToken(cred, gcp.CloudPlatformScope)
+if err != nil {
+    log.Fatal(err)
+}
 request.Header.Set("Authorization", "Bearer "+token)
 ```
 
@@ -68,8 +78,12 @@ example with a `CheckRedirect` function that returns `http.ErrUseLastResponse`.
 ## Refresh-safe credential storage
 
 Providers rotate refresh tokens and detect reuse: presenting an
-old refresh token can revoke the whole grant. `tokenstore` prevents two
-goroutines or processes from spending the same refresh token.
+old refresh token can revoke the whole grant. With a shared exclusive store
+lease, `tokenstore` serializes refreshes per credential key across cooperating
+goroutines and processes. Revision checks preserve newer login/logout state.
+This is not an exactly-once network guarantee after an ambiguous exchange
+failure or a crash before the refreshed record is persisted. The included
+`tokenstore.Memory` store coordinates callers within one process only.
 
 A store implements `tokenstore.Store`:
 
@@ -85,9 +99,20 @@ A store implements `tokenstore.Store`:
 
 ```go
 coordinator, err := tokenstore.NewCoordinator(store, refreshFunc)
+if err != nil {
+    log.Fatal(err)
+}
 
-record, err := coordinator.Token(ctx, "provider")        // refreshes near expiry
-record, err = coordinator.Rejected(ctx, "provider", record) // after an upstream 401
+record, err := coordinator.Token(ctx, "provider") // refreshes near expiry
+if err != nil {
+    log.Fatal(err)
+}
+
+// Only after an upstream request using record is rejected (for example HTTP 401):
+// record, err = coordinator.Rejected(ctx, "provider", record)
+// if err != nil {
+//     log.Fatal(err)
+// }
 ```
 
 The coordinator provides these guarantees:
@@ -98,8 +123,9 @@ The coordinator provides these guarantees:
 - It revokes the credential when the provider rejects the grant permanently.
   `IsTerminal` classifies the refresh error.
 - It never overwrites a login that lands during a refresh.
-- It keeps token material out of errors and out of `Record`'s `String`,
-  `GoString`, and `slog` output.
+- `Record`'s `String`, `GoString`, and `slog` output omit token material.
+  Caller-supplied `Store` and `RefreshFunc` implementations must also return
+  secret-free errors.
 
 Every store implementation should run the conformance suite:
 
